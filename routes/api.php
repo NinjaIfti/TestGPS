@@ -50,9 +50,18 @@ Route::prefix('admin/locations')->middleware(['auth:api', 'throttle:api'])->grou
 
 // Health check endpoint (no authentication required)
 Route::get('health', function () {
+    $redisStatus = 'disconnected';
+
+    try {
+        \Illuminate\Support\Facades\Redis::ping();
+        $redisStatus = 'connected';
+    } catch (\Exception $e) {
+        $redisStatus = 'disconnected';
+    }
+
     return response()->json([
         'status' => 'ok',
         'timestamp' => now()->toIso8601String(),
-        'redis' => \Illuminate\Support\Facades\Redis::ping() ? 'connected' : 'disconnected',
+        'redis' => $redisStatus,
     ]);
 })->name('health');

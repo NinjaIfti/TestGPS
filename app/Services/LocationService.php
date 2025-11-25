@@ -2,186 +2,230 @@
 
 namespace App\Services;
 
-use App\Models\User;
-use App\Models\UserLocation;
-use Illuminate\Support\Facades\Redis;
+use App\Models\LocationUpdate;
 use Carbon\Carbon;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 
 class LocationService
 {
-    /**
-     * Redis key prefix for user locations.
-     */
-    private const LOCATION_PREFIX = 'location:user:';
+    public function __construct(
+        private readonly LocationRedisService $redisService,
+    ) {
+    }
 
     /**
-     * Redis key for active users set.
-     */
-    private const ACTIVE_USERS_KEY = 'active_users';
-
-    /**
-     * Store or update user location in Redis.
-     *
-     * @param int $userId
-     * @param array $locationData
-     * @return array
+     * Persist the latest location for a user in Redis.
      */
     public function storeLocation(int $userId, array $locationData): array
     {
-        $key = $this->getLocationKey($userId);
-        $ttl = config('app.gps_location_ttl', 3600);
+        $payload = $this->prepareRedisPayload($locationData);
 
-        // Add timestamp if not present
-        $locationData['updated_at'] = $locationData['updated_at'] ?? now()->toIso8601String();
-        $locationData['user_id'] = $userId;
+        $this->redisService->storeLocation($userId, $payload);
 
-        // Store location data in Redis as hash
-        Redis::hmset($key, $locationData);
-        Redis::expire($key, $ttl);
-
-        // Add user to active users set with score as timestamp
-        Redis::zadd(self::ACTIVE_USERS_KEY, now()->timestamp, $userId);
-
-        return $locationData;
+        return $this->formatPayloadForResponse($userId, $payload);
     }
 
     /**
-     * Get user location from Redis.
-     *
-     * @param int $userId
-     * @return array|null
+     * Retrieve a user's location from Redis with MySQL fallback.
      */
     public function getLocation(int $userId): ?array
     {
-        $key = $this->getLocationKey($userId);
-        $location = Redis::hgetall($key);
+        $location = $this->redisService->getLocation($userId);
 
-        return !empty($location) ? $location : null;
+        if ($location) {
+            return $location;
+        }
+
+        $record = LocationUpdate::query()->where('user_id', $userId)->first();
+
+        return $record ? $this->formatModelLocation($record) : null;
     }
 
     /**
-     * Get all active users' locations from Redis.
-     *
-     * @param int $limit
-     * @return array
+     * Fetch all active locations, defaulting to Redis.
      */
     public function getAllActiveLocations(int $limit = 10000): array
     {
-        // Get active user IDs from sorted set
-        $userIds = Redis::zrevrange(self::ACTIVE_USERS_KEY, 0, $limit - 1);
+        $locations = $this->redisService->getAllActiveLocations($limit);
 
-        if (empty($userIds)) {
-            return [];
+        if (!empty($locations)) {
+            return array_values($locations);
         }
 
-        $locations = [];
-
-        // Use pipeline for better performance
-        $results = Redis::pipeline(function ($pipe) use ($userIds) {
-            foreach ($userIds as $userId) {
-                $pipe->hgetall($this->getLocationKey($userId));
-            }
-        });
-
-        foreach ($results as $index => $location) {
-            if (!empty($location)) {
-                $locations[] = $location;
-            }
-        }
-
-        return $locations;
+        return LocationUpdate::query()
+            ->latest('updated_at')
+            ->limit($limit)
+            ->get()
+            ->map(fn (LocationUpdate $location) => $this->formatModelLocation($location))
+            ->all();
     }
 
     /**
-     * Get count of active users.
-     *
-     * @return int
+     * Number of users that have not expired in Redis.
      */
     public function getActiveUserCount(): int
     {
-        return Redis::zcard(self::ACTIVE_USERS_KEY);
+        return $this->redisService->getActiveUserCount();
     }
 
     /**
-     * Remove inactive users from active set.
-     * Users are considered inactive if their last update was more than TTL seconds ago.
-     *
-     * @return int Number of users removed
+     * Remove expired users from Redis.
      */
     public function cleanupInactiveUsers(): int
     {
-        $ttl = config('app.gps_location_ttl', 3600);
-        $cutoffTime = now()->subSeconds($ttl)->timestamp;
-
-        return Redis::zremrangebyscore(self::ACTIVE_USERS_KEY, '-inf', $cutoffTime);
+        return $this->redisService->cleanupExpiredUsers();
     }
 
     /**
-     * Get batch of locations for MySQL sync.
-     *
-     * @param int $batchSize
-     * @return array
+     * Batch of locations queued for persistence.
      */
     public function getLocationsForSync(int $batchSize = 1000): array
     {
-        $userIds = Redis::zrevrange(self::ACTIVE_USERS_KEY, 0, $batchSize - 1);
-
-        if (empty($userIds)) {
-            return [];
-        }
-
-        $locations = [];
-
-        foreach ($userIds as $userId) {
-            $location = $this->getLocation($userId);
-            if ($location) {
-                $locations[] = $location;
-            }
-        }
-
-        return $locations;
+        return array_values($this->redisService->getUsersForSync($batchSize));
     }
 
     /**
-     * Delete user location from Redis.
-     *
-     * @param int $userId
-     * @return bool
+     * Delete a user's cached location.
      */
     public function deleteLocation(int $userId): bool
     {
-        $key = $this->getLocationKey($userId);
-
-        Redis::del($key);
-        Redis::zrem(self::ACTIVE_USERS_KEY, $userId);
-
-        return true;
+        return $this->redisService->deleteLocation($userId);
     }
 
     /**
-     * Get Redis key for user location.
-     *
-     * @param int $userId
-     * @return string
+     * Persist latest Redis locations into MySQL and keep Redis tidy.
      */
-    private function getLocationKey(int $userId): string
+    public function syncLocationsToDatabase(int $batchSize = null): array
     {
-        return self::LOCATION_PREFIX . $userId;
+        $batchSize = $batchSize ?? config('gps.max_batch_size', 1000);
+        $locations = $this->redisService->getUsersForSync($batchSize);
+
+        if (empty($locations)) {
+            return [
+                'processed' => 0,
+                'synced' => 0,
+                'errors' => 0,
+                'cleaned' => $this->cleanupInactiveUsers(),
+            ];
+        }
+
+        $synced = 0;
+        $errors = 0;
+
+        DB::transaction(function () use (&$synced, &$errors, $locations) {
+            foreach ($locations as $userId => $location) {
+                try {
+                    LocationUpdate::updateOrCreate(
+                        ['user_id' => $userId],
+                        [
+                            'latitude' => $location['latitude'],
+                            'longitude' => $location['longitude'],
+                            'altitude' => $location['altitude'],
+                            'accuracy' => $location['accuracy'],
+                            'speed' => $location['speed'],
+                            'heading' => $location['heading'],
+                            'recorded_at' => $location['recorded_at']
+                                ? Carbon::parse($location['recorded_at'])
+                                : now(),
+                        ],
+                    );
+
+                    $synced++;
+                } catch (\Throwable $throwable) {
+                    $errors++;
+                    Log::error('Failed to persist user location', [
+                        'user_id' => $userId,
+                        'error' => $throwable->getMessage(),
+                    ]);
+                }
+            }
+        });
+
+        $this->redisService->markAsSynced(array_keys($locations));
+        $cleaned = $this->cleanupInactiveUsers();
+
+        return [
+            'processed' => count($locations),
+            'synced' => $synced,
+            'errors' => $errors,
+            'cleaned' => $cleaned,
+        ];
     }
 
     /**
-     * Get locations within radius (requires Redis Geo commands).
-     * Note: This is an advanced feature that requires storing locations using GEOADD.
-     *
-     * @param float $latitude
-     * @param float $longitude
-     * @param float $radiusKm
-     * @return array
+     * Aggregate runtime stats for dashboards.
      */
-    public function getLocationsNearby(float $latitude, float $longitude, float $radiusKm = 5): array
+    public function getSystemStats(): array
     {
-        // This would require implementing Redis Geospatial indexes
-        // For now, returning empty array - can be implemented if needed
-        return [];
+        $redisStats = $this->redisService->getStats();
+
+        return [
+            'active_users' => $this->getActiveUserCount(),
+            'pending_sync' => $redisStats['pending_sync'],
+            'memory_used' => $redisStats['memory_used'],
+            'config' => [
+                'location_ttl' => config('gps.location_ttl'),
+                'sync_interval' => config('gps.sync_interval'),
+                'max_batch_size' => config('gps.max_batch_size'),
+            ],
+        ];
+    }
+
+    /**
+     * Ensure Redis payload uses numeric types and timestamps.
+     */
+    private function prepareRedisPayload(array $locationData): array
+    {
+        $recordedAt = $locationData['recorded_at'] ?? null;
+        $recordedTimestamp = $recordedAt
+            ? Carbon::parse($recordedAt)->timestamp
+            : now()->timestamp;
+
+        return [
+            'latitude' => (float) $locationData['latitude'],
+            'longitude' => (float) $locationData['longitude'],
+            'altitude' => isset($locationData['altitude']) ? (float) $locationData['altitude'] : null,
+            'accuracy' => isset($locationData['accuracy']) ? (float) $locationData['accuracy'] : null,
+            'speed' => isset($locationData['speed']) ? (float) $locationData['speed'] : null,
+            'heading' => isset($locationData['heading']) ? (float) $locationData['heading'] : null,
+            'recorded_at' => $recordedTimestamp,
+        ];
+    }
+
+    /**
+     * Convert Redis payload into API-friendly format.
+     */
+    private function formatPayloadForResponse(int $userId, array $payload): array
+    {
+        return [
+            'user_id' => $userId,
+            'latitude' => $payload['latitude'],
+            'longitude' => $payload['longitude'],
+            'altitude' => $payload['altitude'],
+            'accuracy' => $payload['accuracy'],
+            'speed' => $payload['speed'],
+            'heading' => $payload['heading'],
+            'recorded_at' => Carbon::createFromTimestamp($payload['recorded_at'])->toIso8601String(),
+            'updated_at' => now()->toIso8601String(),
+        ];
+    }
+
+    /**
+     * Normalize database model output to match API schema.
+     */
+    private function formatModelLocation(LocationUpdate $location): array
+    {
+        return [
+            'user_id' => $location->user_id,
+            'latitude' => (float) $location->latitude,
+            'longitude' => (float) $location->longitude,
+            'altitude' => $location->altitude ? (float) $location->altitude : null,
+            'accuracy' => $location->accuracy ? (float) $location->accuracy : null,
+            'speed' => $location->speed ? (float) $location->speed : null,
+            'heading' => $location->heading ? (float) $location->heading : null,
+            'recorded_at' => $location->recorded_at?->toIso8601String(),
+            'updated_at' => $location->updated_at?->toIso8601String(),
+        ];
     }
 }

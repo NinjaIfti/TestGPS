@@ -2,10 +2,8 @@
 
 namespace App\Services;
 
-use App\Models\LocationUpdate;
-use App\Models\User;
-use Illuminate\Support\Facades\Redis;
 use Carbon\Carbon;
+use Illuminate\Support\Facades\Redis;
 
 class LocationRedisService
 {
@@ -106,19 +104,15 @@ class LocationRedisService
      */
     public function getActiveUsers(int $limit = null, int $offset = 0): array
     {
-        $args = [self::ACTIVE_USERS_SET, '-inf', '+inf', 'WITHSCORES', 'REV'];
-
-        if ($limit !== null) {
-            $args = array_merge($args, ['LIMIT', $offset, $limit]);
-        }
-
-        $results = $this->redis->zrangebyscore(...$args);
+        $start = $offset;
+        $stop = $limit !== null ? ($offset + $limit - 1) : -1;
+        $results = $this->redis->zrevrange(self::ACTIVE_USERS_SET, $start, $stop, ['withscores' => true]);
 
         $users = [];
-        for ($i = 0; $i < count($results); $i += 2) {
+        foreach ($results as $member => $score) {
             $users[] = [
-                'user_id' => (int) $results[$i],
-                'last_update' => (int) $results[$i + 1],
+                'user_id' => (int) $member,
+                'last_update' => (int) $score,
             ];
         }
 
@@ -218,8 +212,8 @@ class LocationRedisService
             'altitude' => isset($data['altitude']) ? (float) $data['altitude'] : null,
             'speed' => isset($data['speed']) ? (float) $data['speed'] : null,
             'heading' => isset($data['heading']) ? (float) $data['heading'] : null,
-            'recorded_at' => isset($data['recorded_at']) ? Carbon::createFromTimestamp($data['recorded_at'])->toIso8601String() : null,
-            'updated_at' => isset($data['updated_at']) ? Carbon::createFromTimestamp($data['updated_at'])->toIso8601String() : null,
+            'recorded_at' => $this->formatTimestamp($data['recorded_at'] ?? null),
+            'updated_at' => $this->formatTimestamp($data['updated_at'] ?? null),
         ];
     }
 
@@ -233,5 +227,22 @@ class LocationRedisService
             'pending_sync' => $this->redis->zcard(self::SYNC_QUEUE_KEY),
             'memory_used' => $this->redis->info('memory')['used_memory_human'] ?? 'N/A',
         ];
+    }
+
+    private function formatTimestamp(mixed $value): ?string
+    {
+        if ($value === null) {
+            return null;
+        }
+
+        try {
+            if (is_numeric($value)) {
+                return Carbon::createFromTimestamp((int) $value)->toIso8601String();
+            }
+
+            return Carbon::parse($value)->toIso8601String();
+        } catch (\Throwable $throwable) {
+            return null;
+        }
     }
 }

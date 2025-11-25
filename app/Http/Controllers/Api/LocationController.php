@@ -45,15 +45,18 @@ class LocationController extends Controller
             'recorded_at' => $request->recorded_at ?? now()->toIso8601String(),
         ];
 
-        // Store in Redis (fast write)
-        $this->locationService->storeLocation($user->id, $locationData);
+        // Store in Redis (fast write) and get normalized payload
+        $normalizedLocation = $this->locationService->storeLocation($user->id, $locationData);
 
-        // Broadcast location update via WebSocket
-        broadcast(new LocationUpdated($user->id, $locationData))->toOthers();
+        // Broadcast location update via WebSocket when enabled
+        if (config('gps.broadcast_enabled', true)) {
+            broadcast(new LocationUpdated($user->id, $normalizedLocation))->toOthers();
+        }
 
         return response()->json([
             'success' => true,
             'message' => 'Location updated successfully',
+            'data' => $normalizedLocation,
         ], 200);
     }
 
@@ -130,7 +133,7 @@ class LocationController extends Controller
             ], 403);
         }
 
-        $limit = $request->input('limit', 10000);
+        $limit = min((int) $request->input('limit', 10000), 20000);
         $locations = $this->locationService->getAllActiveLocations($limit);
         $activeCount = $this->locationService->getActiveUserCount();
 
@@ -160,15 +163,11 @@ class LocationController extends Controller
             ], 403);
         }
 
-        $activeCount = $this->locationService->getActiveUserCount();
+        $stats = $this->locationService->getSystemStats();
 
         return response()->json([
             'success' => true,
-            'data' => [
-                'active_users' => $activeCount,
-                'redis_ttl' => config('app.gps_location_ttl'),
-                'sync_interval' => config('app.gps_sync_interval'),
-            ],
+            'data' => $stats,
         ]);
     }
 
