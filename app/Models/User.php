@@ -23,8 +23,9 @@ class User extends Authenticatable implements JWTSubject
         'email',
         'password',
         'device_id',
-        'role',
+        'device_type',
         'is_active',
+        'is_admin',
     ];
 
     /**
@@ -48,6 +49,7 @@ class User extends Authenticatable implements JWTSubject
             'email_verified_at' => 'datetime',
             'password' => 'hashed',
             'is_active' => 'boolean',
+            'is_admin' => 'boolean',
         ];
     }
 
@@ -65,17 +67,25 @@ class User extends Authenticatable implements JWTSubject
     public function getJWTCustomClaims(): array
     {
         return [
-            'role' => $this->role,
             'device_id' => $this->device_id,
+            'is_admin' => $this->is_admin,
         ];
+    }
+
+    /**
+     * Get all location updates for this user.
+     */
+    public function locationUpdates()
+    {
+        return $this->hasMany(LocationUpdate::class);
     }
 
     /**
      * Get the user's latest location from MySQL.
      */
-    public function location(): HasOne
+    public function latestLocation(): HasOne
     {
-        return $this->hasOne(UserLocation::class)->latestOfMany('recorded_at');
+        return $this->hasOne(LocationUpdate::class)->latestOfMany('recorded_at');
     }
 
     /**
@@ -83,6 +93,6 @@ class User extends Authenticatable implements JWTSubject
      */
     public function isAdmin(): bool
     {
-        return $this->role === 'admin';
+        return $this->is_admin === true;
     }
 }

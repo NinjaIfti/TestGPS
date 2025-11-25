@@ -33,7 +33,8 @@ class AuthController extends Controller
             'email' => 'required|string|email|max:255|unique:users',
             'password' => 'required|string|min:8|confirmed',
             'device_id' => 'nullable|string|unique:users|max:255',
-            'role' => 'sometimes|in:user,admin',
+            'device_type' => 'nullable|string|max:50',
+            'is_admin' => 'sometimes|boolean',
         ]);
 
         if ($validator->fails()) {
@@ -48,7 +49,8 @@ class AuthController extends Controller
             'email' => $request->email,
             'password' => Hash::make($request->password),
             'device_id' => $request->device_id ?? uniqid('device_', true),
-            'role' => $request->role ?? 'user',
+            'device_type' => $request->device_type,
+            'is_admin' => $request->is_admin ?? false,
             'is_active' => true,
         ]);
 
